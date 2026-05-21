@@ -1,0 +1,64 @@
+# =============================================================================
+#  StrataCompute — one-shot run-to-completion Job.
+#
+#  This is the correct K8s primitive for StrataCompute: it builds nothing at
+#  runtime, it runs the test suite + Phase 5 benchmark + Cachegrind and exits.
+#  (A Deployment/Service would be wrong — there is no server, no port; the
+#  process is designed to terminate.)
+#
+#  Latency caveat (matters for an HFT-latency project): sub-microsecond P99
+#  numbers are only trustworthy if the pod gets *exclusive, pinned* cores.
+#  This spec uses Guaranteed QoS (requests == limits, integer CPU) which makes
+#  the pod eligible for the kubelet static CPU Manager. For meaningful figures
+#  the node must run: --cpu-manager-policy=static, CFS quota throttling off,
+#  ideally isolated NUMA-local cores. In a default shared pool the mean is
+#  indicative but the tail will be noisy — say so when reporting.
+#
+#  Image portability caveat: the image is compiled with `-march=native` on the
+#  build host. Run it only on nodes with a compatible CPU (use nodeSelector /
+#  affinity), or rebuild with a fixed -march for heterogeneous clusters.
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stratacompute-bench
+  namespace: stratacompute
+  labels:
+    app.kubernetes.io/name: stratacompute
+    app.kubernetes.io/component: benchmark
+spec:
+  backoffLimit: 1                  # a failed correctness gate must surface
+  activeDeadlineSeconds: 2400      # safety stop (Cachegrind is slow)
+  ttlSecondsAfterFinished: 86400   # auto-clean the finished Job after 24h
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stratacompute
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: stratacompute
+          image: stratacompute:latest      # overridden by kustomization
+          imagePullPolicy: IfNotPresent     # works with kind/minikube loaded images
+          args: ["all"]                     # test -> phase5 -> cachegrind
+          resources:
+            requests:
+              cpu: "2"                       # integer -> static-CPU-manager eligible
+              memory: "2Gi"
+            limits:
+              cpu: "2"                       # == requests -> Guaranteed QoS
+              memory: "2Gi"
+          volumeMounts:
+            - name: reports
+              mountPath: /app/out
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false    # build dirs/results are written
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: reports
+          persistentVolumeClaim:
+            claimName: stratacompute-reports

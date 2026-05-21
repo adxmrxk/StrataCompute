@@ -1,0 +1,8 @@
+# Dedicated namespace so the benchmark Job/CronJob and its report volume are
+# isolated and easy to tear down (`kubectl delete ns stratacompute`).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stratacompute
+  labels:
+    app.kubernetes.io/name: stratacompute

@@ -1,0 +1,31 @@
+# Bundles the StrataCompute K8s manifests.
+#
+#   kubectl apply -k k8s/                 # deploy namespace + PVC + Job + CronJob
+#   kubectl -n stratacompute logs job/stratacompute-bench -f
+#   kubectl delete -k k8s/                # tear everything down
+#
+# Point it at your registry image (the cluster must be able to pull it; for
+# kind/minikube load it locally instead):
+#   cd k8s && kubectl create -o yaml --dry-run=client ... # or edit below:
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: stratacompute
+
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - job.yaml
+  - cronjob.yaml
+
+# Override once here (or `kustomize edit set image
+# stratacompute=<registry>/stratacompute:<tag>`).
+images:
+  - name: stratacompute
+    newName: stratacompute
+    newTag: latest
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: stratacompute

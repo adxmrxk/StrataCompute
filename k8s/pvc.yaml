@@ -1,0 +1,19 @@
+# Holds generated reports (results/*.csv, docs/benchmarks.md, cachegrind.txt)
+# the container copies to /app/out. Survives pod completion so you can pull
+# results with `kubectl cp` after the Job/CronJob finishes.
+#
+# ReadWriteOnce is sufficient: the Job and CronJob are never run concurrently
+# (CronJob uses concurrencyPolicy: Forbid; don't hand-launch the Job while a
+# CronJob pod is active).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: stratacompute-reports
+  namespace: stratacompute
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName omitted -> cluster default StorageClass.
