@@ -18,6 +18,7 @@
 #include "strata/compute/elementwise.hpp"
 
 #include <cstring>
+#include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -189,11 +190,14 @@ struct ForwardEngine::Impl {
         return nullptr;  // unreachable
     }
 
-    void forward(std::span<const float> in, std::span<float> out) {
+    void run(std::span<const float> in, std::span<float> out,
+             std::span<double> step_us) {
         if (in.size() != in_size)
             throw std::runtime_error("ForwardEngine::forward: input size");
         if (out.size() < out_size)
             throw std::runtime_error("ForwardEngine::forward: output too small");
+        if (!step_us.empty() && step_us.size() != plan.size())
+            throw std::runtime_error("ForwardEngine::forward_traced: step count");
 
         // Recycle the activation arena (O(1)) and bump-carve each slot.
         act_pool->reset();
@@ -204,7 +208,11 @@ struct ForwardEngine::Impl {
                 throw std::runtime_error("ForwardEngine: activation arena full");
         }
 
-        for (const Step& st : plan) {
+        for (std::size_t index = 0; index < plan.size(); ++index) {
+            const Step& st = plan[index];
+            const auto start = step_us.empty()
+                ? std::chrono::steady_clock::time_point{}
+                : std::chrono::steady_clock::now();
             if (st.op == Step::Gemm) {
                 const float* x = resolve(st.in, in, out);
                 float*       y = resolve(st.out, in, out);
@@ -217,7 +225,21 @@ struct ForwardEngine::Impl {
                 float*       d = resolve(st.out, in, out);
                 Compute::relu(std::span<float>(d, st.n), s, st.n);
             }
+            if (!step_us.empty()) {
+                const auto finish = std::chrono::steady_clock::now();
+                step_us[index] =
+                    std::chrono::duration<double, std::micro>(finish - start).count();
+            }
         }
+    }
+
+    void forward(std::span<const float> in, std::span<float> out) {
+        run(in, out, {});
+    }
+
+    void forward_traced(std::span<const float> in, std::span<float> out,
+                        std::span<double> step_us) {
+        run(in, out, step_us);
     }
 };
 
@@ -236,6 +258,27 @@ std::size_t ForwardEngine::output_size() const noexcept { return p_->out_size; }
 std::size_t ForwardEngine::num_steps()   const noexcept { return p_->plan.size(); }
 std::size_t ForwardEngine::activation_bytes() const noexcept {
     return p_->act_bytes;
+}
+
+std::vector<ExecutionStep> ForwardEngine::execution_plan() const {
+    std::vector<ExecutionStep> result;
+    result.reserve(p_->plan.size());
+    for (const Impl::Step& step : p_->plan) {
+        if (step.op == Impl::Step::Gemm) {
+            result.push_back({OperationKind::Gemm, step.K, step.M,
+                              step.M, step.K, step.B != nullptr});
+        } else {
+            result.push_back({OperationKind::Relu, step.n, step.n,
+                              0, 0, false});
+        }
+    }
+    return result;
+}
+
+void ForwardEngine::forward_traced(std::span<const float> input,
+                                   std::span<float> output,
+                                   std::span<double> step_us) {
+    p_->forward_traced(input, output, step_us);
 }
 
 } // namespace Strata::Engine

@@ -38,7 +38,28 @@ if(NOT EXISTS "${_ort_root}/include/onnxruntime_cxx_api.h")
        STATUS _dl TLS_VERIFY ON SHOW_PROGRESS)
   list(GET _dl 0 _dl_code)
   if(NOT _dl_code EQUAL 0)
-    message(FATAL_ERROR "ONNX Runtime download failed: ${_dl}")
+    # Some locked-down Windows hosts have a broken Schannel credential store
+    # while Python's verified TLS stack remains usable. Keep CMake as the
+    # primary downloader, but use that standard-library fallback so a clean
+    # build does not depend on a pre-populated build directory.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      message(WARNING "CMake download failed (${_dl}); retrying with Python TLS")
+      execute_process(
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/download_with_python.py"
+                "${_ort_url}" "${_ort_arc}"
+        RESULT_VARIABLE _py_dl_code
+        OUTPUT_VARIABLE _py_dl_out
+        ERROR_VARIABLE _py_dl_err)
+      if(NOT _py_dl_code EQUAL 0)
+        message(FATAL_ERROR
+          "ONNX Runtime download failed through CMake (${_dl}) and Python "
+          "(${_py_dl_err})")
+      endif()
+    else()
+      message(FATAL_ERROR "ONNX Runtime download failed: ${_dl}")
+    endif()
   endif()
   file(ARCHIVE_EXTRACT INPUT "${_ort_arc}" DESTINATION "${_ort_dir}")
 endif()

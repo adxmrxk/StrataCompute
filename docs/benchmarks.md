@@ -6,7 +6,7 @@ Three engines, **identical model** (`models/mlp.onnx`), **identical fixed input*
 
 - CPU: `Intel64 Family 6 Model 151 Stepping 5, GenuineIntel`
 - OS: `Windows-11-10.0.26200-SP0`
-- Python: `3.12.6`, NumPy `1.26.3`, ONNX `1.21.0`
+- Python: `3.12.6`, NumPy `2.2.6`, ONNX `1.21.0`
 - PyTorch: `2.10.0+cpu` (CPU, num_threads=1)
 - C++: MSVC 19.29, `/O2 /arch:AVX2`, ONNX Runtime 1.17.3
 
@@ -16,21 +16,21 @@ Three engines, **identical model** (`models/mlp.onnx`), **identical fixed input*
 
 | Engine | mean | p50 | p95 | p99 | min | max | speed-up vs PyTorch (mean / p99) |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| PyTorch (Python) | 20.974 | 15.500 | 40.900 | 84.900 | 12.700 | 760.500 | 1.0× / 1.0× |
-| ONNX Runtime (C++) | 6.994 | 6.000 | 10.500 | 19.900 | 5.100 | 921.100 | 3.0× / 4.3× |
-| StrataCompute (C++) | 0.122 | 0.100 | 0.200 | 0.200 | 0.100 | 27.600 | 172.5× / 424.5× |
+| PyTorch (Python) | 15.934 | 14.600 | 23.200 | 33.500 | 12.600 | 515.100 | 1.0× / 1.0× |
+| ONNX Runtime (C++) | 5.479 | 5.000 | 7.800 | 9.200 | 4.600 | 504.200 | 2.9× / 3.6× |
+| StrataCompute (C++) | 0.112 | 0.100 | 0.200 | 0.200 | 0.100 | 7.700 | 142.0× / 167.5× |
 
 ## Mean latency
 ```
-PyTorch (Python)       ######################################## 20.974 us
-ONNX Runtime (C++)     ############# 6.994 us
-StrataCompute (C++)    # 0.122 us
+PyTorch (Python)       ######################################## 15.934 us
+ONNX Runtime (C++)     ############## 5.479 us
+StrataCompute (C++)    # 0.112 us
 ```
 
 ## P99 tail latency
 ```
-PyTorch (Python)       ######################################## 84.900 us
-ONNX Runtime (C++)     ######### 19.900 us
+PyTorch (Python)       ######################################## 33.500 us
+ONNX Runtime (C++)     ########### 9.200 us
 StrataCompute (C++)    # 0.200 us
 ```
 

@@ -1,0 +1,24 @@
+# Build trees & generated output are rebuilt inside the image.
+build/
+build-onnx/
+build-bench/
+results/
+docs/benchmarks.md
+
+# VCS / IDE / OS noise
+.git/
+.gitignore
+.vs/
+.vscode/
+.claude/
+*.user
+
+# Anything already downloaded locally (ORT/Google Benchmark caches)
+**/_ort/
+**/_deps/
+**/*.zip
+**/*.tgz
+
+# Windows-only build drivers are irrelevant in the Linux image
+scripts/build-msvc.bat
+scripts/run-phase5.bat

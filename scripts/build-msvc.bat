@@ -13,15 +13,12 @@ set CFG=%1
 if "%CFG%"=="" set CFG=Release
 
 set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-set "CMAKE=C:\Users\AdamR\AppData\Roaming\Python\Python312\site-packages\cmake\data\bin\cmake.exe"
-set "CTEST=C:\Users\AdamR\AppData\Roaming\Python\Python312\site-packages\cmake\data\bin\ctest.exe"
-
 call "%VCVARS%" || exit /b 1
 
 cd /d "%~dp0.."
-"%CMAKE%" -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=%CFG% || exit /b 1
-"%CMAKE%" --build build || exit /b 1
-"%CTEST%" --test-dir build --output-on-failure || exit /b 1
+cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=%CFG% || exit /b 1
+cmake --build build || exit /b 1
+ctest --test-dir build --output-on-failure || exit /b 1
 
 echo.
 echo BUILD+TESTS OK (%CFG%)

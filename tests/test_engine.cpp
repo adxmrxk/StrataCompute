@@ -90,3 +90,25 @@ STRATA_TEST(engine_rejects_wrong_input_size) {
     std::vector<float> out(eng.output_size());
     STRATA_CHECK_THROWS(eng.forward(bad, out), std::runtime_error);
 }
+
+STRATA_TEST(engine_exposes_plan_and_diagnostic_trace) {
+    std::ifstream io(g_models / "mlp_io.csv");
+    const std::vector<float> input = csv_line(io);
+    ForwardEngine eng(g_models / "mlp.onnx");
+    const auto plan = eng.execution_plan();
+    STRATA_CHECK_EQ(plan.size(), 3u);
+    STRATA_CHECK(plan[0].operation == Strata::Engine::OperationKind::Gemm);
+    STRATA_CHECK_EQ(plan[0].rows, 32u);
+    STRATA_CHECK_EQ(plan[0].columns, 16u);
+    STRATA_CHECK(plan[0].has_bias);
+    STRATA_CHECK(plan[1].operation == Strata::Engine::OperationKind::Relu);
+    STRATA_CHECK_EQ(plan[2].rows, 8u);
+
+    std::vector<float> output(eng.output_size());
+    std::vector<double> trace(plan.size());
+    eng.forward_traced(input, output, trace);
+    for (const double elapsed : trace) STRATA_CHECK(elapsed >= 0.0);
+    STRATA_CHECK_THROWS(eng.forward_traced(input, output,
+                                            std::span<double>(trace.data(), 2)),
+                        std::runtime_error);
+}

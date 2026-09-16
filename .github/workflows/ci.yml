@@ -1,0 +1,50 @@
+name: Build and verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.preset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            preset: vs2022-release
+            generator: Visual Studio 17 2022
+            architecture: x64
+          - os: ubuntu-latest
+            preset: linux-release
+            generator: Ninja
+            architecture: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.architecture }}" ]; then
+            cmake -S . -B build -G "${{ matrix.generator }}" -A "${{ matrix.architecture }}" \
+              -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_ONNX=ON -DSTRATA_BUILD_TESTS=ON
+          else
+            cmake -S . -B build -G "${{ matrix.generator }}" \
+              -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_ONNX=ON -DSTRATA_BUILD_TESTS=ON
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Exercise the inference CLI
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            build/tools/Release/strata_infer.exe models/mlp.onnx models/mlp_io.csv --oracle --profile --compare-backends --json
+          else
+            build/tools/strata_infer models/mlp.onnx models/mlp_io.csv --oracle --profile --compare-backends --json
+          fi
