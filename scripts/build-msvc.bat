@@ -1,13 +1,7 @@
 @echo off
-REM ===========================================================================
-REM  StrataCompute — MSVC build driver
-REM
-REM  This box has VS2019 *Build Tools* (no IDE) which CMake's "Visual Studio"
-REM  generator cannot auto-discover via vswhere. We instead initialise the
-REM  MSVC environment with vcvars64.bat and use the NMake Makefiles generator.
-REM
-REM  Usage:  scripts\build-msvc.bat [Release|Debug]
-REM ===========================================================================
+REM StrataCompute MSVC build driver.
+REM Uses the VS2019 Build Tools vcvars64 environment and NMake generator.
+REM Usage: scripts\build-msvc.bat Release or scripts\build-msvc.bat Debug.
 setlocal
 set CFG=%1
 if "%CFG%"=="" set CFG=Release

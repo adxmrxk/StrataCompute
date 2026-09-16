@@ -14,6 +14,7 @@
 /data/demo/
 /models/har_activity.onnx
 /models/har_activity_io.csv
+/models/har_activity_live.onnx
 
 # Third-party fetch/extract caches.
 **/_ort/

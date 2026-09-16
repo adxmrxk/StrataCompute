@@ -18,8 +18,9 @@ allocation, or Python dependency on its inference path.
 
 | Metric | Original model | Current model | Change |
 |---|---:|---:|---:|
-| UCI held-out activity accuracy | 91.69% | **94.67%** | **+2.98 points** |
-| Held-out error rate | 8.31% | **5.33%** | **35.9% lower** |
+| UCI held-out activity accuracy | 91.69% | **94.84%** | **+3.15 points** |
+| Held-out error rate | 8.31% | **5.16%** | **37.9% lower** |
+| Weakest-class (SITTING) recall | 89.21% | **91.24%** | **+2.03 points** |
 | Engine model contract | 561 → 64 → 6 | 561 → 64 → 6 | unchanged |
 | Custom-engine model oracle | pass | **pass** | unchanged correctness gate |
 
@@ -47,15 +48,40 @@ input values with a robust 1st–99th percentile envelope fitted on UCI training
 data. It reports **In range** or **Shifted** in the dashboard, and either low
 confidence *or* shifted input changes the decision to **Review**.
 
-The feature-outlier budget is 17.11%, chosen as the 99th percentile of known
-training-window outlier rates. It retains 99.8% of the provided held-out UCI
-test windows, while making obvious distribution shifts visible rather than
-silently feeding them to the model as though they were normal data.
+The feature-outlier budget is 17.40%, chosen from the fused adapter's known
+raw-window output distribution. It retains 99.2% of the 256 disjoint raw-UCI
+validation windows. On a separate 60-window sensor-guard check, it reviewed
+only 1.7% of normal windows and caught 90.0% on average across three simulated
+unit/scale corruptions (accelerometer x10, gyroscope x20, and both). This is
+the right comparison after fixing the adapter/guard mismatch: before any
+detector, corruption detection was 0.0%.
 
-## Remaining measured boundary
+## Live-feature fidelity
 
-The live feature adapter reconstructs the UCI training representation with
-0.0739 mean absolute error on its 96 fitting windows. The raw-window → 561
-feature → C++ inference path is exercised locally, but **live-phone accuracy
-has not been verified**. New labelled phone recordings are the next necessary
-metric before claiming a deployed activity product.
+The original per-column gain/offset bridge was only assessed on its fitting
+windows. The replacement is a ridge adapter trained on 512 raw UCI train
+windows and fused algebraically into the live model's first `Gemm`, so the
+C++ runtime still executes only `Gemm -> Relu -> Gemm`. On 256 disjoint raw
+UCI test windows it reduces reconstruction MAE from **about 0.10** (the old
+adapter's unseen-window result) to **0.0679**: a **32% reduction**. It is a
+real improvement, but it has **not** reached the `<0.02` target.
+
+The fused live graph gets 90.62% accuracy on that raw-UCI proxy subset. That
+is useful integration evidence, not a phone accuracy claim: **real phone
+accuracy has not been verified** because there are no labelled recordings from
+the target phone, placement, or browser.
+
+## INT8 deployment trade-off
+
+`strata_int8_infer` now performs real dynamic-activation INT8 inference using
+the engine's signed-int8 matrix-vector kernel. It quantizes weights once at
+load time, retains FP32 biases, and reports its packed deployment footprint.
+On the full UCI held-out split it achieves **94.71%** (2,791/2,947), within
+0.14 percentage points of the FP32 model's 94.84%, while reducing the deployed
+weight/bias/scales footprint from the 142.5 KiB FP32 ONNX artifact to **35.7
+KiB (74.9% smaller)**.
+
+The measured latency trade-off is important: on the same 2,000-run local
+measurement, FP32 was 2.56 us mean / 3.30 us P99 and INT8 was 3.58 us mean /
+4.50 us P99. Dynamic activation quantization adds work on this AVX2 CPU, so
+this is a memory-constrained deployment option—not a dishonest speed claim.

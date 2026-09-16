@@ -1,382 +1,129 @@
 # StrataCompute
 
-**A verifiable C++20 inference engine for latency-sensitive, fixed-shape MLPs.**
-
-StrataCompute is a from-scratch C++ inference engine that bypasses Python on the hot path, owns its activation memory, implements SIMD matrix-vector kernels, and reads the small ONNX subset it supports directly. It ships with an executable CLI, oracle checks, determinism checks, backend equivalence checks, execution-plan tracing, CTest coverage, and a repeatable three-engine benchmark.
-
-It is intentionally **not a general ONNX runtime or a web service**. It is a focused systems project for fixed-shape, single-sample feed-forward inference, where the engineering story is owning and validating the latency-critical path end to end.
-
----
-
-## Table of Contents
-
-- [Project Overview](#project-overview)
-- [StrataMotion demo](#stratamotion-demo)
-- [Metric review](docs/metrics.md)
-- [Latest measured latency](#latest-measured-latency)
-- [The Five Phases](#the-five-phases)
-- [Key Engineering Decisions](#key-engineering-decisions)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [Docker Build](#docker-build)
-- [Kubernetes Deployment](#kubernetes-deployment)
-
----
-
-## Project Overview
-
-### What It Is
-
-A single-process, single-thread, statically-linked C++20 library that loads a small ONNX model into custom memory pools, extracts its weights into cache-aligned tensors, and runs forward passes through hand-written AVX2 + FMA kernels. There is no Python anywhere on the hot path. There is no heap allocation anywhere on the hot path. The execution plan is a flat array of operators dispatched without virtual calls.
-
-The goal is not throughput, it is **tail latency**. Most ML inference systems care about how many samples per second they can serve on a hot GPU. StrataCompute cares about how many microseconds the slowest 1% of single-sample inferences take on a cold cache, because that is the number that matters for systems where the next decision has to be made before the next packet arrives.
-
-### The Problem It Solves
-
-PyTorch and ONNX Runtime are excellent general-purpose runtimes, but they are optimized for the average case. Both carry meaningful per-inference overhead: PyTorch from its dynamic dispatch and Python interop layer, ONNX Runtime from its graph manager and memory planner. For a tiny MLP-sized model running a single sample at a time, that overhead dominates the actual arithmetic.
-
-StrataCompute eliminates the overhead by doing every expensive thing **once**: extract weights once at construction, compile the execution plan once, reserve the activation arena once. The forward pass itself then becomes nothing but matrix-vector multiplies and elementwise ops on memory that was already laid out in cache lines exactly the way the kernels want it.
-
-### Supported model contract
-
-This is the precise boundary of the current custom engine:
-
-- One static-shape FP32 input and one static-shape FP32 output.
-- A sequential graph of `Gemm` (`transB=1`, optional bias) and `Relu` nodes.
-- Float `raw_data` initializers on little-endian x86/x64 machines.
-- AVX2/FMA is the Release binary baseline. The scalar path exists for correctness comparison and explicit backend selection, not as a promise that the Release binary runs on non-AVX2 hardware.
-
-Unsupported graphs—including convolution, attention, dynamic shapes, quantized ONNX graphs, branching, and arbitrary protobuf encodings—fail explicitly at model-load time. For a general model runtime, use ONNX Runtime; StrataCompute is the measurable custom path for this deliberately narrow class of models.
-
----
-
-## Latest measured latency
-
-Measured on an Intel i5-12400 (Alder Lake), Windows MSVC `/O2 /arch:AVX2`, single-sample MLP, single thread, identical weights and inputs across all three engines.
-
-| Engine                  | Mean       | P99        |
-|-------------------------|-----------:|-----------:|
-| PyTorch (Python)        | 15.93 µs   | 33.50 µs   |
-| ONNX Runtime (C++)      | 5.48 µs    | 9.20 µs   |
-| **StrataCompute (C++)** | **0.11 µs** | **0.20 µs** |
-
-These are one verified local run on an Intel i5-12400, Windows MSVC `/O2 /arch:AVX2`, 50,000 iterations, with the same model and fixed input across all three engines. They are not portable headline guarantees: turbo state, Windows scheduling, compiler versions, and CPU architecture all affect microsecond results. Re-run `scripts\run-phase5.bat` to generate your own report in `docs/benchmarks.md`.
-
-The correctness gate for that run passed with max absolute error `1.788e-07` against the NumPy oracle for the custom engine and `1.192e-07` for PyTorch.
-
-### Phase 2 measured SIMD acceleration
-
-Hand-rolled AVX2 + FMA versus the explicitly auto-vectorization-suppressed scalar reference:
-
-| Kernel              | 256² | 512² | 1024² |
-|---------------------|-----:|-----:|------:|
-| FP32 scalar → AVX2  | 6.7× | 6.7× |  5.9× |
-| INT8 scalar → AVX2  | 7.0× | 8.4× |  9.0× |
-
-INT8 AVX2 sustains ~28 G MAC/s. FP32 AVX2 sustains ~12–19 G/s.
-
-Full benchmark tables and the latency CSV are in [docs/benchmarks.md](docs/benchmarks.md).
-
----
-
-## The Five Phases
-
-StrataCompute was built phase-by-phase, with each phase as a self-contained deliverable that passes its own test suite under `/W4 /WX`.
-
-### Phase 1 — Memory and Tensor Primitives
-
-- **`Strata::MemoryPool`** — one 64-byte-aligned arena reserved at construction. `try_allocate()` is `noexcept`, heap-free, O(1) bump allocator. `reset()` recycles in O(1) and retains a high-water mark for arena sizing. This is the only memory carve permitted on the hot path.
-- **`Strata::Tensor<T>`** — non-owning, allocation-free, row-major view onto pool memory (rank ≤ 8 with inline metadata). Every `create()` carve starts on a cache line. Provides `std::span` views (`flat()`, `row()`), variadic indexing, and a portable `_mm_prefetch` wrapper.
-
-### Phase 2 — Hand-Rolled SIMD Kernels
-
-`y = W·x` matrix-vector kernels. **Allocation-free and `noexcept` by contract.** Nothing under `Strata::Compute` touches the heap.
-
-- **Scalar reference** (`matvec_*_scalar`) — correctness oracle and benchmark baseline. Inner-loop auto-vectorization is explicitly suppressed so the reported speedup is real, not the optimizer vectorizing for us.
-- **AVX2 + FMA kernels** (`matvec_*_avx2`) — FP32 via 8-wide `_mm256_fmadd_ps` plus horizontal reduce. INT8 via `_mm256_cvtepi8_epi16` → `_mm256_madd_epi16` int32 accumulation, then dequantize `Y = scale·(X·W)`. Unaligned loads are deliberate so the kernels accept arbitrary caller buffers; cache-aligned `Tensor` data still fast-paths. Scalar-tail remainder handled correctly.
-- **`cpu_features()`** — one-time CPUID + XGETBV detection (AVX2 / FMA / AVX-VNNI / AVX-512). Reports AVX-512 false on consumer Alder Lake; this is the live extension seam.
-- **Dispatcher** — `matvec_f32` / `matvec_i8` resolve `Backend::Auto` against the CPU once. `set_backend()` (lock-free atomic) pins scalar or AVX2 for tests and benchmarks. `Backend::AVX512` is reserved and degrades to AVX2 today; a future AVX-512 kernel slots in without touching call sites.
-
-### Phase 3 — ONNX Runtime Baseline
-
-The reference baseline that Phase 5 times against.
-
-- **`Strata::Onnx::OnnxModel`** — pImpl wrapper so `<onnxruntime_cxx_api.h>` never leaks into the public surface. Loads a serialized `.onnx`, exposes I/O names + static shapes + element counts, and runs a single-input/output float graph. `std::filesystem::path::c_str()` gives the right `ORTCHAR_T` on both Windows (`wchar_t`) and POSIX (`char`).
-- **`cmake/onnxruntime.cmake`** — fetches Microsoft's official prebuilt ORT release and exposes it as an imported target. It retries with Python's verified TLS client when a Windows CMake/Schannel download fails. The runtime DLL is auto-copied next to the test exe.
-- **Test model** — `scripts/make_test_model.py` builds a 2-layer MLP (Gemm → Relu → Gemm) with fixed-seed weights and emits a numpy-computed input/output oracle.
-
-### Phase 4 — Custom Forward Pass
-
-The whole stack composed. **ORT-free and offline.**
-
-- **`Strata::Onnx::OnnxGraph`** — a tight, dependency-free reader of just the ONNX protobuf subset needed (ModelProto → GraphProto → node / initializer / value-info). ORT's inference API doesn't expose initializers and pulling in full protobuf is heavy, so we decode the wire format directly (~150 LOC, generic field-skipping). Float `raw_data` initializers only.
-- **`Strata::Engine::ForwardEngine`** — at construction, extracts every float initializer into `Strata::Tensor`s backed by a weights `MemoryPool`, then compiles the node list into a flat execution plan with operands pre-resolved to tagged input/output/slot refs. `forward()` calls `reset()` on the activation arena, bump-carves one buffer per intermediate, and runs the plan through the Phase 2 kernels. **The forward hot path performs zero heap allocations.**
-- **Diagnostic execution tracing** — `execution_plan()` exposes the compiled operation contract, while `forward_traced()` records per-operation timing into caller-owned storage. It is deliberately separate from `forward()` so instrumentation cannot pollute normal latency measurements.
-- **`Strata::Compute::{add_inplace, relu, relu_inplace}`** — the small allocation-free elementwise ops between matvec layers.
-
-`test_engine.cpp` proves the composition: engine output matches the same numpy oracle ONNX Runtime was validated against in Phase 3, 1000 inferences through the recycled arena are bit-identical, and wrong input sizes are rejected.
-
-### Phase 5 — Microsecond Benchmarking
-
-End-to-end three-way latency comparison on the same model and input.
-
-- **`benchmarks/bench_pipeline.cpp`** — times ONNX Runtime (C++) vs StrataCompute with per-inference (not block-averaged) wall timing so the P95 and P99 tail are real. Gates on a correctness check vs the oracle before timing. Writes `results/latency_cpp.csv`.
-- **`scripts/run_phase5.py`** — builds the same MLP in PyTorch (CPU, single thread) from the weights extracted out of `mlp.onnx`, times it, merges the C++ CSV, and renders `results/latency.csv` plus [docs/benchmarks.md](docs/benchmarks.md).
-- **Cache misses** — hardware L1/L2 counters need Linux `perf`, Cachegrind, or Intel PCM. The report gives the exact analytical working set the custom engine touches (~3.5 KiB, fully L1/L2-resident, which is the structural reason the tail is flat) plus the Linux commands for real counters. See [Docker Build](#docker-build) for the Cachegrind path.
-
----
-
-## Key Engineering Decisions
-
-### Allocation-free hot path
-
-Every allocation happens at construction. The forward pass calls `MemoryPool::reset()` and bump-allocates activation buffers into the arena. There is no `new`, no `malloc`, no `std::vector::resize`, no `string` operation on the hot path.
-
-### No virtual calls
-
-The execution plan is a flat array of operator descriptors. Dispatch is a switch over op kind, not a vtable. The branch predictor learns the pattern after the first few inferences and dispatch becomes essentially free.
-
-### Auto-vectorization is suppressed on the scalar reference
-
-A 6× speedup over the scalar baseline is only meaningful if the scalar baseline is actually scalar. The scalar kernels disable auto-vectorization on their inner loops so the AVX2 speedup is real, not the optimizer vectorizing the reference for us.
-
-### Direct ONNX protobuf decode
-
-Linking in the full protobuf library to read a few model fields adds binary size, configure-time cost, and a runtime dependency. The graph reader hand-decodes the protobuf wire format for just the messages needed (ModelProto, GraphProto, NodeProto, TensorProto) in about 150 lines of code.
-
-### Toolchain dual targeting
-
-The original spec assumed GCC + Linux + AVX-512. The actual dev machine forced MSVC + Windows + AVX2. The CMake flag abstraction retains both the GCC `-O3 -march=native -flto -Wall -Wextra -Werror` path and the MSVC `/O2 /GL /W4 /WX /std:c++20 /arch:AVX2` path; the same source tree builds correctly on either.
-
-### AVX-512 is an empty seam
-
-The dispatcher has an `AVX512` backend that degrades to AVX2 today. When this project runs on hardware where Intel hasn't fused AVX-512 off (server parts, or 11th-gen and earlier consumer), a future AVX-512 kernel slots in by implementing one function and updating the dispatcher table.
-
----
-
-## Tech Stack
-
-| Component                | Notes |
-|--------------------------|-------|
-| **Language**             | C++20 |
-| **Build system**         | CMake 3.20+ |
-| **Compilers tested**     | MSVC 19.29 (`/O2 /GL /W4 /WX /std:c++20 /arch:AVX2`) and GCC (`-O3 -march=native -flto -Wall -Wextra -Wpedantic -Werror`) |
-| **Testing**              | Custom lightweight harness + Google Benchmark for Phase 2/5 |
-| **ONNX Runtime**         | Microsoft's prebuilt release 1.17.3, fetched at configure time |
-| **PyTorch (Phase 5)**    | CPU build, single-thread, used only for the latency comparison |
-| **SIMD**                 | AVX2 + FMA. AVX-512 / AVX-VNNI detection live, kernels reserved |
-| **Containerization**     | Docker (GCC `-O3 -march=native` + Valgrind / Cachegrind) |
-| **Orchestration**        | Kubernetes `Job` and `CronJob` for batch latency-drift watch |
-
----
-
-## Project Structure
-
-```
-stratacompute/
-│
-├── include/strata/
-│   ├── memory_pool.hpp                MemoryPool: bump arena, 64-byte aligned
-│   ├── tensor.hpp                     Tensor<T>: non-owning view, rank ≤ 8
-│   ├── compute/
-│   │   ├── matvec.hpp                 matvec_f32 / matvec_i8 with backend enum
-│   │   ├── elementwise.hpp            add_inplace, relu, relu_inplace
-│   │   └── cpu_features.hpp           CPUID + XGETBV detection
-│   ├── onnx/
-│   │   ├── onnx_model.hpp             pImpl ORT wrapper
-│   │   └── onnx_graph.hpp             Custom protobuf reader
-│   └── engine/
-│       └── forward_engine.hpp         Custom pure-C++ forward pass
-│
-├── src/
-│   ├── memory_pool.cpp
-│   ├── compute/
-│   │   ├── cpu_features.cpp
-│   │   ├── matvec_scalar.cpp          Reference baseline (auto-vec suppressed)
-│   │   ├── matvec_avx2.cpp            Hand-written FP32 + INT8 kernels
-│   │   ├── matvec_dispatch.cpp        Backend resolution
-│   │   └── elementwise.cpp
-│   ├── onnx/
-│   │   ├── onnx_model.cpp             ORT wrapper implementation
-│   │   └── onnx_graph.cpp             Protobuf decoder (~150 LOC)
-│   └── engine/
-│       └── forward_engine.cpp         Compile + run flat execution plan
-│
-├── tools/
-│   ├── strata_infer.cpp                Standalone inference, validation, JSON CLI
-│   ├── strata_stream.cpp                Persistent JSONL inference process for the demo
-│   └── CMakeLists.txt                  CLI target + end-to-end smoke test
-│
-├── benchmarks/
-│   ├── bench_matvec.cpp               Phase 2 kernel benchmarks
-│   ├── bench_memory_pool.cpp
-│   └── bench_pipeline.cpp             Phase 5 latency comparison
-│
-├── tests/
-│   ├── test_main.cpp                  Custom harness
-│   ├── test_memory_pool.cpp
-│   ├── test_tensor.cpp
-│   ├── test_compute.cpp               Scalar vs AVX2 equivalence
-│   ├── test_onnx.cpp                  Phase 3 ORT vs numpy oracle
-│   └── test_engine.cpp                Phase 4 custom forward pass
-│
-├── cmake/
-│   └── onnxruntime.cmake              Prebuilt ORT fetcher
-│
-├── scripts/
-│   ├── make_test_model.py             Generate mlp.onnx + oracle
-│   ├── get_uci_har.py                 Download + safely extract CC BY 4.0 demo data
-│   ├── train_har_demo.py              Train/export the compatible activity MLP
-│   ├── run-stratamotion.bat           One-command Windows demo launcher
-│   ├── run_phase5.py                  Three-way latency runner
-│   ├── run-phase5.bat
-│   └── docker-entrypoint.sh           test / phase5 / cachegrind
-│
-├── k8s/                               Job + CronJob manifests (see below)
-│   ├── job.yaml
-│   ├── cronjob.yaml
-│   ├── namespace.yaml
-│   ├── pvc.yaml
-│   └── kustomization.yaml
-│
-├── models/                            mlp.onnx + mlp_io.csv (committed)
-├── demo/                              Local dashboard, server, and activity labels
-├── data/                              Downloaded/generated demo data (gitignored)
-├── results/                           Benchmark output CSVs
-├── docs/benchmarks.md                 Rendered Phase 5 results
-│
-├── CMakeLists.txt
-├── CMakePresets.json                   Reproducible Windows/Linux CI presets
-├── Dockerfile
-└── README.md
-```
-
----
+**A verifiable C++20 inference engine for small, latency-sensitive MLPs.**
+
+StrataCompute loads a deliberately small ONNX subset and runs it without
+Python or ONNX Runtime on the inference path. It preloads weights, compiles a
+flat execution plan, reuses a preallocated activation arena, and executes
+hand-written AVX2/FMA matrix-vector kernels. The result is a focused systems
+project for fixed-shape, single-sample `Gemm -> Relu -> Gemm` models - not a
+general ONNX runtime or web service.
+
+## Why it exists
+
+Small control, sensor, and embedded-style ML workloads can spend more time in
+runtime overhead than in arithmetic. StrataCompute moves model parsing, weight
+packing, plan construction, and memory allocation out of the hot path. Each
+inference is then matrix-vector work plus elementwise operations on already
+allocated memory.
+
+The project includes a CLI, deterministic repeat checks, NumPy oracle checks,
+scalar-versus-SIMD equivalence checks, operation tracing, CTest coverage, and
+a repeatable benchmark path.
+
+## What is supported
+
+- Static-shape FP32 input/output and a sequential `Gemm` (`transB=1`, optional
+  bias) / `Relu` graph.
+- AVX2/FMA FP32 kernels plus a scalar reference path.
+- A dynamic-activation INT8 execution mode with packed INT8 weights.
+- Explicit failure for unsupported graphs such as convolution, attention,
+  branching, dynamic shapes, and arbitrary quantized ONNX graphs.
 
 ## StrataMotion demo
 
-StrataMotion is the project’s **no-hardware recruiter demo**. It replays real, held-out smartphone motion windows through this repository’s persistent custom C++ engine and presents the prediction, confidence, feature values, and per-operation trace in a local browser dashboard. It is not a second model written in JavaScript or Python. On a compatible phone browser, **Use phone sensors** collects one 2.56-second motion window, converts it locally into the ordered 561-value UCI HAR feature contract, and sends that vector through the same C++ engine.
+`StrataMotion` turns the engine into a local machine-health/activity-monitor
+demo. It replays held-out UCI Human Activity Recognition windows in a browser
+dashboard and sends every prediction to the persistent custom C++ runner.
+Replay works without hardware. The optional phone path collects one 2.56-second
+motion window in a compatible browser and keeps the request local.
 
-The source is UCI’s *Human Activity Recognition Using Smartphones* dataset: 10,299 labelled windows from accelerometer and gyroscope recordings of six everyday activities. UCI licenses it under **CC BY 4.0**, which permits sharing and adaptation for any purpose with appropriate credit. This repository retains the attribution in the dashboard and demo metadata; the downloaded source data and generated model are deliberately gitignored. See [docs/stratamotion-demo.md](docs/stratamotion-demo.md) for the full attribution, safety boundary, and demo script.
-
-On Windows, from the repository root:
+The raw-sensor adapter is fused into the first model layer, so live C++
+inference still uses only `Gemm -> Relu -> Gemm`. The local Python server still
+constructs the 561 sensor features, but no longer applies an additional adapter
+matrix per request. UCI HAR is CC BY 4.0; see
+[the demo guide](docs/stratamotion-demo.md) for attribution and safe-demo
+boundaries.
 
 ```bat
 scripts\run-stratamotion.bat
 ```
 
-That downloads the official 58.2 MB archive on first use, trains and exports `561 -> 64 -> 6` as the custom engine’s supported `Gemm -> Relu -> Gemm` graph, builds/tests the C++ project, and starts the local-only dashboard. Open **http://127.0.0.1:8080**. Replay needs no physical sensor. The optional live button needs a compatible device browser plus motion permission; it stays local and does not upload data.
+Then open http://127.0.0.1:8080.
 
-For the underlying model directly:
+## Measured results
+
+All model-quality figures use UCI HAR's provided held-out split unless stated
+otherwise. Re-run the commands to reproduce them; microsecond timing varies by
+CPU, compiler, power state, and OS scheduling.
+
+| Result | Before | Current | Evidence |
+|---|---:|---:|---|
+| Activity accuracy | 91.69% | **94.84%** | Held-out UCI test split |
+| Error rate | 8.31% | **5.16%** | 37.9% lower |
+| Weakest class: SITTING recall | 89.21% | **91.24%** | Class-balanced training candidate |
+| Raw-to-feature MAE | about 0.10 | **0.0679** | 256 unseen raw-UCI windows |
+| Packed model footprint | 142.5 KiB FP32 | **35.7 KiB INT8** | 74.9% smaller |
+| INT8 accuracy | - | **94.71%** | 2,791 / 2,947 held-out samples |
+
+The live raw-UCI proxy path scores 90.62% on its 256-window subset. This is
+integration evidence, not a phone claim: real-phone accuracy is **not yet
+verified** because labelled recordings from the target device, placement, and
+browser have not been collected. Likewise, the adapter has improved but has
+not met the `<0.02` MAE target.
+
+INT8 is a memory trade-off on the current AVX2 machine, not a speed claim. In
+the same 2,000-run local comparison, FP32 measured 2.56 us mean / 3.30 us P99,
+while dynamic INT8 measured 3.58 us / 4.50 us. See
+[the full metrics review](docs/metrics.md) for methodology and guard results.
+
+## Run it
+
+Build and run all tests on Windows with Visual Studio 2019 Build Tools:
+
+```bat
+scripts\build-msvc.bat Release
+```
+
+Run the committed oracle model through the custom engine:
+
+```bat
+build\tools\strata_infer.exe models\mlp.onnx models\mlp_io.csv ^
+  --oracle --verify-repeats 1000 --iterations 1000 --profile ^
+  --compare-backends --trace
+```
+
+After running the StrataMotion launcher, validate the trained activity model:
 
 ```bat
 build\tools\strata_infer.exe models\har_activity.onnx models\har_activity_io.csv ^
   --oracle --verify-repeats 100 --iterations 500 --profile --compare-backends --trace
 ```
 
----
-
-## Getting Started
-
-### Windows / MSVC
-
-VS2019 Build Tools is the Build Tools SKU (no IDE), which CMake's Visual Studio generator can't auto-discover via `vswhere`. Drive the build through `vcvars64` plus the NMake Makefiles generator:
+Measure the actual INT8 execution path, footprint, output delta, and held-out
+accuracy:
 
 ```bat
-scripts\build-msvc.bat Release
+build\tools\strata_int8_infer.exe models\har_activity.onnx ^
+  "data\uci_har\UCI HAR Dataset\test\X_test.txt" ^
+  --iterations 2000 --verify-fp32 ^
+  --labels "data\uci_har\UCI HAR Dataset\test\y_test.txt"
 ```
 
-Manual equivalent (from a `vcvars64`-initialized shell):
+For the optional ONNX Runtime/PyTorch comparison, run
+`scripts\run-phase5.bat`. Docker and Kubernetes benchmark templates remain in
+the repository; they are batch benchmark tooling, not a deployed web product.
 
-```bat
-cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
+## Project map
 
-### Run a real inference (no ONNX Runtime needed)
+| Location | Purpose |
+|---|---|
+| `include/strata`, `src/` | Memory pool, ONNX reader, SIMD kernels, FP32 and INT8 engines |
+| `tools/` | `strata_infer`, `strata_int8_infer`, and persistent `strata_stream` CLIs |
+| `demo/` | Local StrataMotion dashboard and raw-sensor feature bridge |
+| `scripts/` | Build, dataset, training, evaluation, and benchmark commands |
+| `tests/` | Unit and end-to-end engine checks |
+| `docs/` | Benchmark, metric, and demo methodology |
 
-`strata_infer` is the project-facing executable. It loads the model through the custom parser and runs the custom `ForwardEngine`; it does not call ONNX Runtime.
-
-```bat
-cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target strata_infer
-build\tools\strata_infer.exe models\mlp.onnx models\mlp_io.csv ^
-  --oracle --verify-repeats 1000 --iterations 1000 --profile ^
-  --compare-backends --trace
-```
-
-That command proves five things in one run: the model loads, its output matches the committed NumPy oracle, repeated custom-engine outputs are bit-identical, scalar and auto-selected kernels agree within tolerance, and the selected backend's latency distribution is reported.
-
-For CI, dashboards, or scripts, add `--json`. The JSON result includes model shape, active backend, activation arena size, latency percentiles, output, oracle error, determinism status, scalar-vs-auto delta, and—when `--trace` is supplied—the compiled plan plus diagnostic timing for every step.
-
-### Phase 3 ONNX baseline (opt-in)
-
-Off by default; downloads the prebuilt ONNX Runtime 1.17.3 win-x64 release (~62 MB) at configure time:
-
-```bat
-cmake -S . -B build-onnx -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release ^
-      -DSTRATA_BUILD_ONNX=ON -DSTRATA_BUILD_TESTS=ON
-cmake --build build-onnx --target strata_onnx_test
-build-onnx\strata_onnx_test.exe models
-```
-
-### Phase 2 benchmarks (opt-in)
-
-Google Benchmark is fetched at configure time, so the suite needs network:
-
-```bat
-cmake -S . -B build-bench -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release ^
-      -DSTRATA_BUILD_BENCHMARKS=ON -DSTRATA_BUILD_TESTS=OFF
-cmake --build build-bench --target bench_matvec
-build-bench\benchmarks\bench_matvec.exe --benchmark_min_time=0.2s
-```
-
-### Phase 5 latency comparison
-
-```bat
-scripts\run-phase5.bat
-```
-
-This first configures and builds the complete ONNX tree, runs every CTest target, then runs the C++ and PyTorch benchmark stages. It needs `pip install torch onnx numpy`.
-
----
-
-## Docker Build
-
-The Docker image realizes the spec's original intended toolchain: GCC with `-O3 -march=native -flto -Wall -Wextra -Wpedantic -Werror`, C++20. Includes Valgrind, so the real L1/LL cache-miss counts the spec asked for (impossible to capture on Windows) can be measured.
-
-```sh
-docker build -t stratacompute .                                       # builds + runs P1/2/4 (ctest gate)
-docker run --rm stratacompute                                          # test + phase5 + cachegrind
-docker run --rm stratacompute test                                     # just the suites
-docker run --rm -v "$PWD/out:/app/out" stratacompute phase5            # collect reports
-docker run --rm -v "$PWD/out:/app/out" stratacompute cachegrind        # real cache misses
-```
-
-The offline suite (Phases 1, 2, 4) is compiled **and run** during `docker build`, so the image fails to build if anything regresses under GCC `-Werror`. The build is its own verification gate.
-
----
-
-## Kubernetes Deployment
-
-The manifests are deployment templates and have **not** been exercised against a live cluster by this repository's local test suite. They require a reachable cluster, a storage class, and an image registry or a locally loaded image. They do not create a web endpoint; they run the benchmark workload to completion.
-
-StrataCompute is a **batch workload**: it runs the suite + Phase 5 benchmark + Cachegrind to completion and exits. The correct primitives are a `Job` (one-shot run) and a `CronJob` (scheduled latency-drift watch), not a `Deployment` / `Service`. There is no server, no port, nothing to load-balance. A Deployment would just crash-loop on the process exiting.
-
-```sh
-# Build and push the image first (or load it into kind/minikube).
-# Edit the images: block in k8s/kustomization.yaml to point at your registry.
-
-kubectl apply -k k8s/
-kubectl -n stratacompute logs job/stratacompute-bench -f
-kubectl -n stratacompute cp <pod>:/app/out ./out      # pull reports
-kubectl delete -k k8s/
-```
-
-The manifests encode several things that matter for HFT-grade latency work:
-
-- **Guaranteed QoS** (`requests == limits`, integer CPU) so the pod is eligible for the kubelet's static CPU Manager. Sub-microsecond P99 is only trustworthy with `--cpu-manager-policy=static`, CFS throttling off, and NUMA-local isolated cores on the node.
-- **`-march=native` portability** — the image is compiled for the build host's CPU; pin nodes via `nodeSelector` / affinity to a matching CPU, or rebuild with a fixed `-march` for heterogeneous clusters, otherwise SIGILL.
-- `restartPolicy: Never` + `backoffLimit: 1` so a failed correctness gate surfaces instead of silently retrying. PVC retains reports after pod exit.
+The key architecture rule is simple: model load and memory setup happen once;
+the custom forward path performs no heap allocations.

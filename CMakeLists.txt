@@ -72,7 +72,8 @@ add_library(strata_core STATIC
   src/compute/matvec_dispatch.cpp
   src/compute/elementwise.cpp
   src/onnx/onnx_graph.cpp
-  src/engine/forward_engine.cpp)
+  src/engine/forward_engine.cpp
+  src/engine/quantized_forward_engine.cpp)
 target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # PRIVATE: the zero-warning/opt policy applies to strata_core's own TUs, not
 # forced onto consumers (e.g. bench_pipeline pulls in third-party ORT headers

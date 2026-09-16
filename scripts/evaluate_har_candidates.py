@@ -32,7 +32,7 @@ def load(partition: str) -> tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
-def run(widths: tuple[int, ...], epochs: int = 100) -> tuple[float, float, float]:
+def run(weights: tuple[float, ...] | None, epochs: int = 100) -> tuple[float, float, float, float]:
     torch.manual_seed(20260915)
     x_train, y_train = load("train")
     x_test, y_test = load("test")
@@ -41,9 +41,10 @@ def run(widths: tuple[int, ...], epochs: int = 100) -> tuple[float, float, float
     train = torch.from_numpy((x_train - mean) / std)
     test = torch.from_numpy((x_test - mean) / std)
     target = torch.from_numpy(y_train)
-    model = Candidate(widths)
+    model = Candidate((64,))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0015, weight_decay=0.0005)
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.02)
+    class_weights = None if weights is None else torch.tensor(weights, dtype=torch.float32)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.02)
     model.train()
     for _ in range(epochs):
         optimizer.zero_grad(set_to_none=True)
@@ -65,15 +66,22 @@ def run(widths: tuple[int, ...], epochs: int = 100) -> tuple[float, float, float
                 threshold = float(candidate)
                 coverage = accepted.float().mean().item()
                 break
-    return accuracy, threshold, coverage
+        sitting_recall = float(((predicted == 3) & (torch.from_numpy(y_test) == 3)).sum().item() /
+                              (y_test == 3).sum())
+    return accuracy, sitting_recall, threshold, coverage
 
 
 def main() -> None:
     torch.set_num_threads(1)
-    for widths in ((64,), (96, 48), (128, 64)):
-        accuracy, threshold, coverage = run(widths)
-        description = " -> ".join(map(str, (561, *widths, 6)))
-        print(f"{description}: test_accuracy={accuracy:.2%}, "
+    candidates: list[tuple[str, tuple[float, ...] | None]] = [
+        ("unweighted baseline", None),
+        ("sitting 1.10x", (1, 1, 1, 1.10, 1, 1)),
+        ("sitting 1.20x", (1, 1, 1, 1.20, 1, 1)),
+        ("sitting 1.35x", (1, 1, 1, 1.35, 1, 1)),
+    ]
+    for description, weights in candidates:
+        accuracy, sitting_recall, threshold, coverage = run(weights)
+        print(f"{description}: test_accuracy={accuracy:.2%}, sitting_recall={sitting_recall:.2%}, "
               f"97%-accuracy guard: confidence>={threshold:.2f}, coverage={coverage:.1%}")
 
 

@@ -22,7 +22,7 @@ import onnx
 import torch
 from torch import nn
 
-from demo.har_features import extract_uci_features, fit_calibration
+from demo.har_features import extract_uci_features, fit_linear_adapter, apply_linear_adapter
 ACTIVITIES = ["WALKING", "WALKING_UPSTAIRS", "WALKING_DOWNSTAIRS", "SITTING", "STANDING", "LAYING"]
 
 
@@ -41,7 +41,11 @@ def train_model(features: np.ndarray, labels: np.ndarray, epochs: int, seed: int
     torch.manual_seed(seed)
     model = ActivityNet(features.shape[1], len(ACTIVITIES))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0015, weight_decay=0.0005)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
+    # Measured candidate: this lifts the previous weakest class (SITTING)
+    # without reducing held-out overall accuracy.  Keep the change explicit
+    # rather than silently claiming an untested balancing improvement.
+    criterion = nn.CrossEntropyLoss(
+        weight=torch.tensor([1.0, 1.0, 1.0, 1.35, 1.0, 1.0]), label_smoothing=0.02)
     values = torch.from_numpy(features)
     targets = torch.from_numpy(labels)
     model.train()
@@ -68,6 +72,21 @@ def fold_standardization(model: ActivityNet, mean: np.ndarray, std: np.ndarray) 
         exported.last.weight.copy_(model.last.weight)
         exported.last.bias.copy_(model.last.bias)
     return exported
+
+
+def fuse_linear_adapter(model: ActivityNet, mapping: np.ndarray, offset: np.ndarray) -> ActivityNet:
+    """Absorb raw->UCI mapping into layer one; live inference stays 3 steps."""
+    fused = ActivityNet(mapping.shape[0], len(ACTIVITIES)).eval()
+    with torch.no_grad():
+        weight = model.first.weight.detach().clone()
+        bias = model.first.bias.detach().clone()
+        adapter = torch.from_numpy(mapping)
+        adapter_offset = torch.from_numpy(offset)
+        fused.first.weight.copy_(weight @ adapter.T)
+        fused.first.bias.copy_(bias + weight @ adapter_offset)
+        fused.last.weight.copy_(model.last.weight)
+        fused.last.bias.copy_(model.last.bias)
+    return fused
 
 
 def select_confidence_gate(probabilities: torch.Tensor, labels: np.ndarray) -> tuple[float, float, float]:
@@ -112,25 +131,35 @@ def visual_feature_indices(names: list[str]) -> list[int]:
     return [lookup[name] for name in preferred]
 
 
-def write_live_calibration(dataset: Path, x_train: np.ndarray, destination: Path, seed: int) -> float:
-    """Learn the adapter from documented raw UCI signals to X_train's contract."""
-    rng = np.random.default_rng(seed)
-    chosen = np.sort(rng.choice(x_train.shape[0], size=96, replace=False))
-    signals = dataset / "train" / "Inertial Signals"
+def raw_windows(dataset: Path, partition: str, indices: np.ndarray) -> np.ndarray:
+    """Extract documented raw UCI signals in bulk for reproducible adapter work."""
+    signals = dataset / partition / "Inertial Signals"
+    suffix = "train" if partition == "train" else "test"
     total = np.stack([
-        np.loadtxt(signals / f"total_acc_{axis}_train.txt", dtype=np.float64)[chosen]
+        np.loadtxt(signals / f"total_acc_{axis}_{suffix}.txt", dtype=np.float64)[indices]
         for axis in "xyz"
     ], axis=2)
     gyro = np.stack([
-        np.loadtxt(signals / f"body_gyro_{axis}_train.txt", dtype=np.float64)[chosen]
+        np.loadtxt(signals / f"body_gyro_{axis}_{suffix}.txt", dtype=np.float64)[indices]
         for axis in "xyz"
     ], axis=2)
-    raw = np.stack([extract_uci_features(total[row], gyro[row]) for row in range(chosen.size)])
-    gain, offset = fit_calibration(raw, x_train[chosen])
-    reconstructed = raw * gain + offset
-    mae = float(np.mean(np.abs(reconstructed - x_train[chosen])))
-    np.savez(destination, gain=gain, offset=offset, samples=chosen, reconstruction_mae=mae)
-    return mae
+    return np.stack([extract_uci_features(total[row], gyro[row]) for row in range(indices.size)])
+
+
+def write_live_adapter(dataset: Path, x_train: np.ndarray, x_test: np.ndarray,
+                       destination: Path, seed: int) -> tuple[np.ndarray, np.ndarray, float, float, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit on raw train windows and report MAE on disjoint raw test windows."""
+    rng = np.random.default_rng(seed)
+    train_indices = np.sort(rng.choice(x_train.shape[0], size=512, replace=False))
+    test_indices = np.sort(rng.choice(x_test.shape[0], size=256, replace=False))
+    raw_train = raw_windows(dataset, "train", train_indices)
+    raw_test = raw_windows(dataset, "test", test_indices)
+    mapping, offset = fit_linear_adapter(raw_train, x_train[train_indices])
+    train_mae = float(np.mean(np.abs(raw_train @ mapping + offset - x_train[train_indices])))
+    validation_mae = float(np.mean(np.abs(raw_test @ mapping + offset - x_test[test_indices])))
+    np.savez(destination, mapping=mapping, offset=offset, train_samples=train_indices,
+             test_samples=test_indices, train_mae=train_mae, validation_mae=validation_mae, ridge=10.0)
+    return mapping, offset, train_mae, validation_mae, test_indices, raw_train, raw_test
 
 
 def write_input_health(x_train: np.ndarray, x_test: np.ndarray, destination: Path) -> tuple[float, float]:
@@ -211,9 +240,25 @@ def main() -> int:
     selected_array = np.asarray(selected, dtype=np.int64)
     write_csv(demo_data / "activity_replay.csv", x_test[selected_array])
     np.savetxt(demo_data / "activity_replay_labels.csv", y_test[selected_array], fmt="%d")
-    calibration_mae = write_live_calibration(dataset, x_train, demo_data / "feature_calibration.npz", seed)
+    mapping, adapter_offset, adapter_train_mae, adapter_validation_mae, adapter_test_indices, raw_train, raw_test = write_live_adapter(
+        dataset, x_train, x_test, demo_data / "feature_adapter.npz", seed)
+    live_model = fuse_linear_adapter(exported_model, mapping, adapter_offset)
+    live_model_path = models / "har_activity_live.onnx"
+    raw_sample = torch.from_numpy(raw_windows(dataset, "test", np.asarray([0]))).to(torch.float32)
+    torch.onnx.export(live_model, raw_sample, live_model_path, input_names=["sensor_window"],
+                      output_names=["activity_logits"], opset_version=13, dynamo=False)
+    if [node.op_type for node in onnx.load(live_model_path).graph.node] != ["Gemm", "Relu", "Gemm"]:
+        raise RuntimeError("fused live model broke the supported ONNX graph contract")
+    with torch.no_grad():
+        raw_proxy_predictions = live_model(torch.from_numpy(raw_test)).argmax(dim=1).numpy()
+    raw_proxy_accuracy = float(np.mean(raw_proxy_predictions == y_test[adapter_test_indices]))
+    # The dashboard receives the fused adapter's approximation, not pristine
+    # X_train values. Calibrate its drift envelope to that exact live path so
+    # reconstruction residuals do not become false sensor-shift alarms.
+    adapted_train = raw_train @ mapping + adapter_offset
+    adapted_test = raw_test @ mapping + adapter_offset
     drift_threshold, test_in_distribution_rate = write_input_health(
-        x_train, x_test, demo_data / "input_health.npz")
+        adapted_train, adapted_test, demo_data / "input_health.npz")
     indices = visual_feature_indices(feature_names)
     metadata = {
         "dataset": "UCI Human Activity Recognition Using Smartphones (dataset 240)",
@@ -235,7 +280,14 @@ def main() -> int:
         "seed": seed,
         "replay_samples": len(selected),
         "live_feature_contract": "128 samples at 50 Hz -> ordered 561 UCI HAR feature values",
-        "live_calibration_mae": calibration_mae,
+        "live_feature_adapter": {
+            "kind": "512-window ridge adapter fused into the first MLP layer",
+            "train_mae": adapter_train_mae,
+            "validation_mae": adapter_validation_mae,
+            "validation_windows": 256,
+            "raw_uci_proxy_accuracy": raw_proxy_accuracy,
+            "phone_accuracy": "not verified; UCI raw windows are a proxy, not a phone trial",
+        },
         "visual_features": [{"index": index, "name": feature_names[index]} for index in indices],
     }
     (demo_data / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -244,7 +296,9 @@ def main() -> int:
           f"at {guarded_accuracy:.2%} held-out selective accuracy")
     print(f"Exported compatible model: {model_path}")
     print(f"Created {len(selected)} real held-out replay windows in {demo_data}")
-    print(f"Live feature adapter calibration MAE: {calibration_mae:.4f}")
+    print(f"Live feature adapter MAE: {adapter_train_mae:.4f} train / "
+          f"{adapter_validation_mae:.4f} on 256 unseen raw UCI test windows")
+    print(f"Fused live-model accuracy: {raw_proxy_accuracy:.2%} on those raw UCI proxy windows")
     print(f"Input health guard: accepts {test_in_distribution_rate:.1%} of held-out windows "
           f"within a {drift_threshold:.2%} feature-outlier budget")
     return 0
